@@ -29,7 +29,7 @@ Usage:
 ```
 git clone compile-ai
 cd compile-ai
-sudo mv compile-ai /usr/local/bin/ 
+sudo mv speedpy /usr/local/bin/ 
 pip install anthropic
 speedpy <options> <path_to_file>
 ```
