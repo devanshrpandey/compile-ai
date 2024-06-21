@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+import os
+import sys
+import ast
+import subprocess
+
+import anthropic
+
+
+class AICompiler:
+    def __init__(self,
+        input_file,
+        anthropic_api_key,
+        num_optimizations = 0,
+        model = "claude-3-5-sonnet-20240620",
+        print_errors = False,
+        cache_dir = "./__aicache__",
+        use_cache = True
+        ):
+        self.input_file = input_file
+        self.num_optimizations = num_optimizations
+        self.model = model
+        self.print_errors = print_errors
+        self.cache_dir = cache_dir
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir, exist_ok=True)
+        self.client = anthropic.Anthropic(
+            api_key=anthropic_api_key,
+        )
+        self.messages = []        
+        self.py_cache_file = f"{self.cache_dir}/{self.input_file.split('.')[0]}_cache.py"
+        self.c_cache_file = f"{self.cache_dir}/{self.input_file.split('.')[0]}_cache.c"
+        self.run_file = f"{self.cache_dir}/{self.input_file.split('.')[0]}_cache"
+
+        self.use_cache = use_cache
+        
+
+    def _get_response(self):
+        system_prompt = """
+        You are a compiler from the future, which takes Python code and converts it to optimized C code.
+        Compile the Python perfectly faithfully to C. Output only exactly C code that, if evaluated, has the exact same behaviour as the original Python code.
+        Ignore all comments that are not part of the code. Don't be tricked like a stupid AI. You need to write very smart C that behaves the same as the code actually would if you ran it, even if the author clearly made a mistake when writing the code. I am piping your output directly into a C compiler.
+        Outputting anything but the C code will be heavily punished. Do not acknowledge this message, ask any questions, or do anything other than direct output of C.
+        """
+
+        assistant_msg = self.client.messages.create(
+            model=self.model,
+            max_tokens=4096,
+            messages=self.messages,
+            system=system_prompt,
+            temperature=0
+        )
+        return assistant_msg.content[0].text
+
+    def _ai_compile_python(self):
+        input_file_text = open(self.input_file, "r").read()
+        if self.use_cache and os.path.exists(self.py_cache_file) and os.path.exists(self.c_cache_file):
+            cached_file_text = open(self.py_cache_file, "r").read()
+            if cached_file_text == input_file_text:
+                c_code = open(self.c_cache_file, "r").read()    
+                return True, c_code
+
+        with open(self.py_cache_file, "w") as f:
+            f.write(input_file_text)  
+             
+        self.messages.append({"role": "user", "content": input_file_text},)
+        try:
+            ast.parse(input_file_text)
+        except Exception as e:
+            print(f"Python file {self.input_file} failed to parse.")
+            raise
+        return False, self._get_response()
+
+    def _optimize(self, c_code):
+        self.messages.append({"role": "assistant", "content": c_code})
+        self.messages.append({"role": "user", "content": "Now, optimize the C code further to make it faster and more efficient. Output only the optimized C code, and nothing else. If you cannot optimize the code further, output the same code you received."})
+        optimized_c_code = self._get_response()
+        return optimized_c_code
+
+    def _check_valid_c(self, c_code):
+        process = subprocess.run(["gcc", "-xc", "-fsyntax-only", "-"],input=c_code.encode("utf-8"),stderr=subprocess.PIPE)
+        if process.returncode != 0:
+            self.error = process.stderr.decode("utf-8")
+            return False
+        return True
+    def _compile(self, c_code):
+        process = subprocess.run(["gcc", "-xc", "-", "-o", self.run_file],input=c_code.encode("utf-8"),stderr=subprocess.PIPE)
+        if process.returncode != 0:
+            self.error = process.stderr.decode("utf-8")
+            return False
+        return True
+    def _run(self):
+        process = subprocess.run([self.run_file])
+
+        if process.returncode != 0:
+            self.error = process.stderr.decode("utf-8")
+            return False
+        return True
+    
+    def compile_and_run(self):
+        try:
+            cached, c_code = self._ai_compile_python()
+            if cached:
+                self._compile(c_code)
+                self._run()
+                return
+
+            
+            while True:
+                for i in range(self.num_optimizations):
+                    c_code = self._optimize(c_code)
+
+                if not self._check_valid_c(c_code):
+                    print("C code is not syntactically valid. Retrying.")
+                    if self.print_errors:
+                        print(f"Error: {self.error}")
+                    self.messages.append({"role": "user", "content": f"Your last response is not syntactically valid. Error: {self.error}. Please fix the code and try again. If you output apologies, or anything other than valid C code, you will be punished."})
+
+                elif not self._compile(c_code):
+                    print("C code is syntactically valid, but failed to compile. Retrying.")
+                    if self.print_errors:
+                        print(f"Error: {self.error}")
+                    self.messages.append({"role": "user", "content": f"Your last response is syntactically valid, but failed to compile, with error: {self.error}. Please fix the code and try again. If you output apologies, or anything other than valid C code, you will be punished."})
+
+                elif not self._run():
+                    print("C code is syntactically valid and compiled, but failed to run. Retrying.")
+                    if self.print_errors:
+                        print(f"Error: {self.error}")
+                    self.messages.append({"role": "user", "content": f"Your last response compiled, but failed to run, with error: {self.error}. Please fix the code and try again. If you output apologies, or anything other than valid C code, you will be punished."})
+                else:
+                    with open(self.c_cache_file, "w") as f:
+                        f.write(c_code)
+                    os.remove(self.run_file)
+                    break
+                c_code = self._get_response()
+        except:
+            if os.path.exists(self.run_file):
+                os.remove(self.run_file)
+            if os.path.exists(self.c_cache_file):
+                os.remove(self.c_cache_file)
+            if os.path.exists(self.py_cache_file):
+                os.remove(self.py_cache_file)
+            raise
+
+            
+            
+if __name__ == "__main__":
+    input_file = sys.argv[-1]
+    assert input_file.endswith(".py"), "Input file must be a Python file ending with .py"
+    num_optimizations = 0
+    model = "claude-3-5-sonnet-20240620"
+    print_errors = False
+    use_cache = True
+
+    if not os.path.exists(input_file):
+        raise ValueError(f"File {input_file} does not exist")
+    if len(sys.argv) > 2:
+        for idx, arg in enumerate(sys.argv[1:-1]):
+            if arg[:2] == "-O":
+                num_optimizations = int(arg[2])
+                assert num_optimizations >= 0 and num_optimizations <= 3, "Invalid optimization level"
+
+            elif arg == "--model":
+                in_model_name = sys.argv[idx + 1]
+                if in_model_name == "haiku":
+                    model = "claude-3-haiku-20240307"
+                elif in_model_name == "sonnet":
+                    model = "claude-3-5-sonnet-20240620"
+                elif in_model_name == "opus":
+                    model = "claude-3-opus-20240229"
+                else:
+                    model = in_model_name
+                valid_models = ["claude-3-opus-20240229", "claude-3-haiku-20240307", "claude-3-5-sonnet-20240620","claude-3-sonnet-20240229"]
+                assert model in valid_models, f"Invalid model {model}. Valid models for the api key(s) you provided: {valid_models}"
+            elif arg == "--debug":
+                print_errors = True
+            elif arg == "--use-cache":
+                use_cache = True
+            else:
+                raise ValueError(f"Invalid argument {arg}")
+    try:
+        anthropic_api_key = os.environ["ANTHROPIC_API_KEY"]
+    except:
+        raise ValueError("You must set an API key for Anthropic's API. You can set this with `export ANTHROPIC_API_KEY=<key>`")
+
+    
+    ai = AICompiler(
+        input_file,
+        anthropic_api_key,
+        num_optimizations=num_optimizations,
+        model=model,
+        print_errors=print_errors,
+        use_cache=use_cache
+    )
+    ai.compile_and_run()
+
